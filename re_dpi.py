@@ -15,6 +15,8 @@ from enum import Enum
 import hashlib
 import json
 import sys
+from urllib.parse import urlparse
+
 
 logging.basicConfig(
     level=logging.INFO,
@@ -144,26 +146,117 @@ class TCPObfuscator:
         else:
             await self._send_with_jitter(writer, data)
 
-    async def _send_with_segmentation(self, writer: asyncio.StreamWriter, data: bytes):
-        segment_size = random.choice([512, 1024, 1200, 1400])
-        burst_size = self.profile.packet_burst_size
-        min_delay, max_delay = self.profile.delay_jitter_ms
+    async def make_request(self, path: str = "/", headers: Optional[Dict[str, str]] = None, max_redirects: int = 3) -> Optional[str]:
+        """Make request with automatic redirect following"""
+        redirect_count = 0
+        current_path = path
 
-        for i in range(0, len(data), segment_size * burst_size):
-            burst = data[i:i + segment_size * burst_size]
+        while redirect_count <= max_redirects:
+            start_time = time.time()
+            profile_hash = hashlib.md5(str(self.current_profile.__dict__).encode()).hexdigest()
 
-            for j in range(0, len(burst), segment_size):
-                segment = burst[j:j + segment_size]
-                writer.write(segment)
-                await writer.drain()
+            if self.optimizer.should_optimize():
+                self.current_profile = self.optimizer.generate_optimized_profile(self.current_profile)
 
-                if j + segment_size < len(burst):
-                    await asyncio.sleep(random.uniform(0.001, 0.008))
+            try:
+                fronting_host = self.current_profile.fronting_host
+                actual_host = self.target_host
 
-            if i + segment_size * burst_size < len(data):
-                jitter_delay = random.uniform(min_delay / 1000.0, max_delay / 1000.0)
-                await asyncio.sleep(jitter_delay)
+                logger.info(f"📡 Connecting via fronting: TLS={fronting_host} | HTTP-Host={actual_host} | Path={current_path}")
 
+                ssl_context = ssl.create_default_context()
+                ssl_context.check_hostname = False
+                ssl_context.verify_mode = ssl.CERT_NONE
+                ssl_context.set_ciphers("ECDHE+AESGCM:ECDHE+CHACHA20:DHE+AESGCM:DHE+CHACHA20")
+                ssl_context.set_alpn_protocols(["http/1.1"])
+
+                addr_info = await asyncio.get_event_loop().getaddrinfo(
+                    actual_host, self.target_port,
+                    family=socket.AF_INET, type=socket.SOCK_STREAM
+                )
+                target_ip = addr_info[0][4][0]
+
+                reader, writer = await asyncio.wait_for(
+                    asyncio.open_connection(
+                        target_ip,
+                        self.target_port,
+                        ssl=ssl_context,
+                        server_hostname=fronting_host
+                    ),
+                    timeout=15.0
+                )
+
+                if headers is None:
+                    headers = self._build_headers(actual_host)
+
+                request_lines = [f"GET {current_path} HTTP/1.1", f"Host: {actual_host}"]
+                for key, value in headers.items():
+                    request_lines.append(f"{key}: {value}")
+                request_lines.extend(["", ""])
+                request = "\r\n".join(request_lines).encode()
+
+                tcp_obfuscator = TCPObfuscator(self.current_profile)
+                await tcp_obfuscator.send_with_obfuscation(writer, request)
+
+                response = await asyncio.wait_for(self._read_response(reader), timeout=20.0)
+
+                writer.close()
+                await writer.wait_closed()
+
+                # Проверяем, редирект ли это
+                if response.startswith("HTTP/1.1 301") or response.startswith("HTTP/1.1 302") or response.startswith("HTTP/1.1 307") or response.startswith("HTTP/1.1 308"):
+                    location = None
+                    lines = response.split("\n")
+                    for line in lines:
+                        if line.lower().startswith("location:"):
+                            location = line.split(":", 1)[1].strip()
+                            break
+
+                    if location:
+                        logger.info(f"↪️  Redirected to: {location}")
+                        # Обрабатываем относительные редиректы
+                        if location.startswith("/"):
+                            current_path = location
+                        else:
+                            # Если абсолютный URL — извлекаем путь
+                            from urllib.parse import urlparse
+                            parsed = urlparse(location)
+                            if parsed.netloc and parsed.netloc != actual_host:
+                                logger.warning(f"⚠️  Redirect to external domain: {parsed.netloc} — following anyway")
+                            current_path = parsed.path + (("?" + parsed.query) if parsed.query else "")
+                        redirect_count += 1
+                        continue
+                    else:
+                        logger.warning("⚠️  Redirect response without Location header")
+                        self.optimizer.record_attempt(profile_hash, True, time.time() - start_time)
+                        return response
+
+                # Успешный не-редирект ответ
+                latency = time.time() - start_time
+                self.optimizer.record_attempt(profile_hash, True, latency)
+                self.successful_sessions += 1
+                self.session_count += 1
+
+                return response
+
+            except ssl.SSLError as e:
+                if "APPLICATION_DATA_AFTER_CLOSE_NOTIFY" in str(e):
+                    logger.warning("⚠️  DPI detected: connection terminated by middlebox")
+                else:
+                    logger.error(f"SSL Error: {e}")
+            except asyncio.TimeoutError:
+                logger.error("⏱️  Timeout: DPI may be throttling or dropping packets")
+            except Exception as e:
+                logger.error(f"Request failed: {e}")
+
+            latency = time.time() - start_time
+            self.optimizer.record_attempt(profile_hash, False, latency)
+            self.session_count += 1
+            return None
+
+        logger.warning(f"🛑 Too many redirects ({max_redirects}) — returning last response")
+        return None
+    
     async def _send_with_jitter(self, writer: asyncio.StreamWriter, data: bytes):
         writer.write(data)
         await writer.drain()
