@@ -1,4 +1,4 @@
-# re_dpi.py — v3: Domain Fronting + Adaptive Obfuscation for Reddit
+# re_dpi.py — v3.1: Domain Fronting + Adaptive Obfuscation for Reddit — FIXED
 # Bypasses DPI by disguising as Cloudflare-legitimate traffic
 # Works in Termux, Android, without root
 
@@ -29,7 +29,7 @@ logger = logging.getLogger("re_dpi")
 class ObfuscationMode(Enum):
     TCP_SEGMENTATION = "tcp_segmentation"
     DELAY_JITTER = "delay_jitter"
-    DOMAIN_FRONTING = "domain_fronting"  # ← ключевое нововведение
+    DOMAIN_FRONTING = "domain_fronting"
     USER_AGENT_ROTATION = "user_agent_rotation"
     HEADER_OBFUSCATION = "header_obfuscation"
 
@@ -37,7 +37,7 @@ class ObfuscationMode(Enum):
 class ConnectionProfile:
     delay_jitter_ms: Tuple[int, int] = (1, 15)
     packet_burst_size: int = 3
-    fronting_host: str = "cloudflare.com"  # маскируемся под этот домен на TLS уровне
+    fronting_host: str = "cloudflare.com"
     obfuscation_modes: List[ObfuscationMode] = None
 
     def __post_init__(self):
@@ -85,8 +85,8 @@ class SmartParameterOptimizer:
             "1.1.1.1",
             "workers.dev",
             "pages.dev",
-            "discord.com",  # тоже на CF
-            "telegram.org"  # иногда на CF
+            "discord.com",
+            "telegram.org"
         ]
 
         for i in range(5):
@@ -138,13 +138,13 @@ class TCPObfuscator:
     def __init__(self, profile: ConnectionProfile):
         self.profile = profile
 
-    async def send_with_obfuscation(self, writer: asyncio.StreamWriter,  bytes):
+    async def send_with_obfuscation(self, writer: asyncio.StreamWriter, data: bytes):
         if ObfuscationMode.TCP_SEGMENTATION in self.profile.obfuscation_modes:
             await self._send_with_segmentation(writer, data)
         else:
             await self._send_with_jitter(writer, data)
 
-    async def _send_with_segmentation(self, writer: asyncio.StreamWriter,  bytes):
+    async def _send_with_segmentation(self, writer: asyncio.StreamWriter, data: bytes):
         segment_size = random.choice([512, 1024, 1200, 1400])
         burst_size = self.profile.packet_burst_size
         min_delay, max_delay = self.profile.delay_jitter_ms
@@ -164,7 +164,7 @@ class TCPObfuscator:
                 jitter_delay = random.uniform(min_delay / 1000.0, max_delay / 1000.0)
                 await asyncio.sleep(jitter_delay)
 
-    async def _send_with_jitter(self, writer: asyncio.StreamWriter,  bytes):
+    async def _send_with_jitter(self, writer: asyncio.StreamWriter, data: bytes):
         writer.write(data)
         await writer.drain()
         min_delay, max_delay = self.profile.delay_jitter_ms
@@ -188,20 +188,17 @@ class RedditDPIBypasser:
             self.current_profile = self.optimizer.generate_optimized_profile(self.current_profile)
 
         try:
-            # 🔥 DOMAIN FRONTING: TLS SNI ≠ HTTP Host
             fronting_host = self.current_profile.fronting_host
             actual_host = self.target_host
 
             logger.info(f"📡 Connecting via fronting: TLS={fronting_host} | HTTP-Host={actual_host}")
 
-            # Настройка SSL — без проверки имени, чтобы не ругался на несоответствие
             ssl_context = ssl.create_default_context()
-            ssl_context.check_hostname = False  # ← важно для Domain Fronting
-            ssl_context.verify_mode = ssl.CERT_NONE  # ← в Termux иногда нужно, если системные сертификаты не настроены
+            ssl_context.check_hostname = False
+            ssl_context.verify_mode = ssl.CERT_NONE
             ssl_context.set_ciphers("ECDHE+AESGCM:ECDHE+CHACHA20:DHE+AESGCM:DHE+CHACHA20")
             ssl_context.set_alpn_protocols(["http/1.1"])
 
-            # Подключаемся к IP Reddit, но говорим, что хотим fronting_host
             addr_info = await asyncio.get_event_loop().getaddrinfo(
                 actual_host, self.target_port,
                 family=socket.AF_INET, type=socket.SOCK_STREAM
@@ -213,12 +210,11 @@ class RedditDPIBypasser:
                     target_ip,
                     self.target_port,
                     ssl=ssl_context,
-                    server_hostname=fronting_host  # ← подмена на уровне TLS
+                    server_hostname=fronting_host
                 ),
                 timeout=15.0
             )
 
-            # Строим HTTP-запрос с настоящим хостом
             if headers is None:
                 headers = self._build_headers(actual_host)
 
@@ -228,11 +224,9 @@ class RedditDPIBypasser:
             request_lines.extend(["", ""])
             request = "\r\n".join(request_lines).encode()
 
-            # Отправляем с обфускацией
             tcp_obfuscator = TCPObfuscator(self.current_profile)
             await tcp_obfuscator.send_with_obfuscation(writer, request)
 
-            # Читаем ответ
             response = await asyncio.wait_for(self._read_response(reader), timeout=20.0)
 
             latency = time.time() - start_time
@@ -310,8 +304,7 @@ class RedditDPIBypasser:
                 break
             response_data += chunk
 
-            # Парсим заголовки, если ещё не сделали
-            if not headers_done and b"\r\n\r\n" in response_data:
+            if not headers_done and b"\r\n\r\n" in response_
                 headers_done = True
                 header_bytes = response_data.split(b"\r\n\r\n", 1)[0]
                 header_text = header_bytes.decode('utf-8', errors='ignore').lower()
@@ -326,11 +319,9 @@ class RedditDPIBypasser:
                 if "transfer-encoding: chunked" in header_text:
                     chunked = True
 
-            # Эвристика: если получили много данных — хватит
             if len(response_data) > 50000:
                 break
 
-            # Если знаем длину — ждём полных данных
             if content_length and len(response_data) >= content_length + len(header_bytes) + 4:
                 break
 
@@ -351,7 +342,7 @@ class RedditDPIBypasser:
         }
 
 async def main():
-    parser = argparse.ArgumentParser(description="Reddit DPI Bypasser v3 — Domain Fronting Edition")
+    parser = argparse.ArgumentParser(description="Reddit DPI Bypasser v3.1 — Domain Fronting FIXED")
     parser.add_argument("--host", default="www.reddit.com", help="Target host (default: www.reddit.com)")
     parser.add_argument("--port", type=int, default=443, help="Target port (default: 443)")
     parser.add_argument("--path", default="/", help="Request path (default: /)")
@@ -367,7 +358,6 @@ async def main():
         response = await bypasser.make_request(args.path)
         if response:
             logger.info("✅ Success! Received response from Reddit.")
-            # Показываем статус и заголовок
             lines = response.split("\n")
             for line in lines[:10]:
                 if line.startswith("HTTP/") or "<title>" in line:
