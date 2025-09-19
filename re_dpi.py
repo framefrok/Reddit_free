@@ -1,7 +1,6 @@
-# re_dpi.py — FIXED: DPI circumvention tool for Reddit access on Android/Termux
-# Now compatible with asyncio transport and avoids SSL socket manipulation
-# Author: Advanced Network Obfuscation Engineer
-# License: MIT
+# re_dpi.py — v3: Domain Fronting + Adaptive Obfuscation for Reddit
+# Bypasses DPI by disguising as Cloudflare-legitimate traffic
+# Works in Termux, Android, without root
 
 import asyncio
 import ssl
@@ -17,7 +16,6 @@ import hashlib
 import json
 import sys
 
-# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
@@ -31,7 +29,7 @@ logger = logging.getLogger("re_dpi")
 class ObfuscationMode(Enum):
     TCP_SEGMENTATION = "tcp_segmentation"
     DELAY_JITTER = "delay_jitter"
-    FAKE_SNI = "fake_sni"
+    DOMAIN_FRONTING = "domain_fronting"  # ← ключевое нововведение
     USER_AGENT_ROTATION = "user_agent_rotation"
     HEADER_OBFUSCATION = "header_obfuscation"
 
@@ -39,7 +37,7 @@ class ObfuscationMode(Enum):
 class ConnectionProfile:
     delay_jitter_ms: Tuple[int, int] = (1, 15)
     packet_burst_size: int = 3
-    fake_sni: Optional[str] = None
+    fronting_host: str = "cloudflare.com"  # маскируемся под этот домен на TLS уровне
     obfuscation_modes: List[ObfuscationMode] = None
 
     def __post_init__(self):
@@ -47,6 +45,7 @@ class ConnectionProfile:
             self.obfuscation_modes = [
                 ObfuscationMode.TCP_SEGMENTATION,
                 ObfuscationMode.DELAY_JITTER,
+                ObfuscationMode.DOMAIN_FRONTING,
                 ObfuscationMode.USER_AGENT_ROTATION
             ]
 
@@ -80,6 +79,16 @@ class SmartParameterOptimizer:
         logger.info("Optimizing evasion parameters based on network feedback")
 
         variations = []
+        fronting_candidates = [
+            "cloudflare.com",
+            "cdnjs.com",
+            "1.1.1.1",
+            "workers.dev",
+            "pages.dev",
+            "discord.com",  # тоже на CF
+            "telegram.org"  # иногда на CF
+        ]
+
         for i in range(5):
             variant = ConnectionProfile()
             variant.delay_jitter_ms = (
@@ -87,12 +96,7 @@ class SmartParameterOptimizer:
                 random.randint(10, 50)
             )
             variant.packet_burst_size = random.randint(1, 5)
-            variant.fake_sni = random.choice([
-                None,
-                "www.google.com",
-                "cloudflare.com",
-                "wikipedia.org"
-            ])
+            variant.fronting_host = random.choice(fronting_candidates)
             variant.obfuscation_modes = random.sample(
                 list(ObfuscationMode),
                 k=random.randint(2, 4)
@@ -114,18 +118,18 @@ class SmartParameterOptimizer:
         ))
 
         if best_score > current_score * 1.2:
-            logger.info(f"Switching to optimized profile with score {best_score:.2f}")
+            logger.info(f"🚀 Switching to optimized profile: fronting={best_variant.fronting_host}, score={best_score:.2f}")
             self.last_optimization = time.time()
             return best_variant
         else:
-            logger.info("Current profile remains optimal")
+            logger.info("✅ Current profile remains optimal")
             return current_profile
 
     def _profile_hash(self, profile: ConnectionProfile) -> str:
         profile_dict = {
             "delay_jitter": profile.delay_jitter_ms,
             "burst_size": profile.packet_burst_size,
-            "sni": profile.fake_sni,
+            "fronting": profile.fronting_host,
             "modes": [mode.value for mode in profile.obfuscation_modes]
         }
         return hashlib.md5(json.dumps(profile_dict, sort_keys=True).encode()).hexdigest()
@@ -134,14 +138,14 @@ class TCPObfuscator:
     def __init__(self, profile: ConnectionProfile):
         self.profile = profile
 
-    async def send_with_obfuscation(self, writer: asyncio.StreamWriter, data: bytes):
+    async def send_with_obfuscation(self, writer: asyncio.StreamWriter,  bytes):
         if ObfuscationMode.TCP_SEGMENTATION in self.profile.obfuscation_modes:
             await self._send_with_segmentation(writer, data)
         else:
             await self._send_with_jitter(writer, data)
 
-    async def _send_with_segmentation(self, writer: asyncio.StreamWriter, data: bytes):
-        segment_size = 1024
+    async def _send_with_segmentation(self, writer: asyncio.StreamWriter,  bytes):
+        segment_size = random.choice([512, 1024, 1200, 1400])
         burst_size = self.profile.packet_burst_size
         min_delay, max_delay = self.profile.delay_jitter_ms
 
@@ -154,13 +158,13 @@ class TCPObfuscator:
                 await writer.drain()
 
                 if j + segment_size < len(burst):
-                    await asyncio.sleep(random.uniform(0.001, 0.005))
+                    await asyncio.sleep(random.uniform(0.001, 0.008))
 
             if i + segment_size * burst_size < len(data):
                 jitter_delay = random.uniform(min_delay / 1000.0, max_delay / 1000.0)
                 await asyncio.sleep(jitter_delay)
 
-    async def _send_with_jitter(self, writer: asyncio.StreamWriter, data: bytes):
+    async def _send_with_jitter(self, writer: asyncio.StreamWriter,  bytes):
         writer.write(data)
         await writer.drain()
         min_delay, max_delay = self.profile.delay_jitter_ms
@@ -184,41 +188,52 @@ class RedditDPIBypasser:
             self.current_profile = self.optimizer.generate_optimized_profile(self.current_profile)
 
         try:
-            # Use fake SNI if enabled
-            server_hostname = self.current_profile.fake_sni or self.target_host
+            # 🔥 DOMAIN FRONTING: TLS SNI ≠ HTTP Host
+            fronting_host = self.current_profile.fronting_host
+            actual_host = self.target_host
 
-            # Create SSL context
+            logger.info(f"📡 Connecting via fronting: TLS={fronting_host} | HTTP-Host={actual_host}")
+
+            # Настройка SSL — без проверки имени, чтобы не ругался на несоответствие
             ssl_context = ssl.create_default_context()
+            ssl_context.check_hostname = False  # ← важно для Domain Fronting
+            ssl_context.verify_mode = ssl.CERT_NONE  # ← в Termux иногда нужно, если системные сертификаты не настроены
             ssl_context.set_ciphers("ECDHE+AESGCM:ECDHE+CHACHA20:DHE+AESGCM:DHE+CHACHA20")
             ssl_context.set_alpn_protocols(["http/1.1"])
 
-            # Open connection
+            # Подключаемся к IP Reddit, но говорим, что хотим fronting_host
+            addr_info = await asyncio.get_event_loop().getaddrinfo(
+                actual_host, self.target_port,
+                family=socket.AF_INET, type=socket.SOCK_STREAM
+            )
+            target_ip = addr_info[0][4][0]
+
             reader, writer = await asyncio.wait_for(
                 asyncio.open_connection(
-                    self.target_host,
+                    target_ip,
                     self.target_port,
                     ssl=ssl_context,
-                    server_hostname=server_hostname
+                    server_hostname=fronting_host  # ← подмена на уровне TLS
                 ),
-                timeout=10.0
+                timeout=15.0
             )
 
-            # Build request
+            # Строим HTTP-запрос с настоящим хостом
             if headers is None:
-                headers = self._build_headers()
+                headers = self._build_headers(actual_host)
 
-            request_lines = [f"GET {path} HTTP/1.1", f"Host: {self.target_host}"]
+            request_lines = [f"GET {path} HTTP/1.1", f"Host: {actual_host}"]
             for key, value in headers.items():
                 request_lines.append(f"{key}: {value}")
             request_lines.extend(["", ""])
             request = "\r\n".join(request_lines).encode()
 
-            # Send with obfuscation
+            # Отправляем с обфускацией
             tcp_obfuscator = TCPObfuscator(self.current_profile)
             await tcp_obfuscator.send_with_obfuscation(writer, request)
 
-            # Read response
-            response = await asyncio.wait_for(self._read_response(reader), timeout=15.0)
+            # Читаем ответ
+            response = await asyncio.wait_for(self._read_response(reader), timeout=20.0)
 
             latency = time.time() - start_time
             self.optimizer.record_attempt(profile_hash, True, latency)
@@ -230,14 +245,22 @@ class RedditDPIBypasser:
 
             return response
 
+        except ssl.SSLError as e:
+            if "APPLICATION_DATA_AFTER_CLOSE_NOTIFY" in str(e):
+                logger.warning("⚠️  DPI detected: connection terminated by middlebox")
+            else:
+                logger.error(f"SSL Error: {e}")
+        except asyncio.TimeoutError:
+            logger.error("⏱️  Timeout: DPI may be throttling or dropping packets")
         except Exception as e:
-            latency = time.time() - start_time
-            self.optimizer.record_attempt(profile_hash, False, latency)
-            self.session_count += 1
             logger.error(f"Request failed: {e}")
-            return None
 
-    def _build_headers(self) -> Dict[str, str]:
+        latency = time.time() - start_time
+        self.optimizer.record_attempt(profile_hash, False, latency)
+        self.session_count += 1
+        return None
+
+    def _build_headers(self, host: str) -> Dict[str, str]:
         headers = {
             "User-Agent": self._get_random_user_agent(),
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -249,11 +272,12 @@ class RedditDPIBypasser:
         }
 
         if ObfuscationMode.HEADER_OBFUSCATION in self.current_profile.obfuscation_modes:
-            # Add some noise headers
             noise_headers = {
-                "X-Forwarded-For": f"192.168.{random.randint(0,255)}.{random.randint(0,255)}",
-                "X-Real-IP": f"172.16.{random.randint(0,255)}.{random.randint(0,255)}",
-                "X-Client-IP": f"10.0.{random.randint(0,255)}.{random.randint(0,255)}"
+                "X-Forwarded-For": f"{random.randint(1,255)}.{random.randint(0,255)}.{random.randint(0,255)}.{random.randint(1,254)}",
+                "X-Real-IP": f"172.{random.randint(16,31)}.{random.randint(0,255)}.{random.randint(1,254)}",
+                "X-Client-IP": f"10.{random.randint(0,255)}.{random.randint(0,255)}.{random.randint(1,254)}",
+                "X-Originating-IP": f"192.168.{random.randint(0,255)}.{random.randint(1,254)}",
+                "Via": f"1.1 Chrome-Compression-Proxy, 1.1 {host}"
             }
             headers.update(noise_headers)
 
@@ -268,23 +292,48 @@ class RedditDPIBypasser:
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15",
             "Mozilla/5.0 (X11; Linux x86_64; rv:109.0) Gecko/20100101 Firefox/115.0",
             "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
-            "Mozilla/5.0 (Linux; Android 14; SM-S911B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Mobile Safari/537.36"
+            "Mozilla/5.0 (Linux; Android 14; SM-S911B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Mobile Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/119.0",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
         ]
         return random.choice(agents)
 
     async def _read_response(self, reader: asyncio.StreamReader) -> str:
         response_data = b""
+        content_length = None
+        chunked = False
+        headers_done = False
+
         while True:
-            try:
-                chunk = await reader.read(4096)
-                if not chunk:
-                    break
-                response_data += chunk
-                if b"\r\n\r\n" in response_data and len(response_data) > 1000:
-                    # Heuristic: assume headers are done + some body
-                    break
-            except asyncio.IncompleteReadError:
+            chunk = await reader.read(4096)
+            if not chunk:
                 break
+            response_data += chunk
+
+            # Парсим заголовки, если ещё не сделали
+            if not headers_done and b"\r\n\r\n" in response_data:
+                headers_done = True
+                header_bytes = response_data.split(b"\r\n\r\n", 1)[0]
+                header_text = header_bytes.decode('utf-8', errors='ignore').lower()
+                if "content-length:" in header_text:
+                    try:
+                        for line in header_text.split("\r\n"):
+                            if line.startswith("content-length:"):
+                                content_length = int(line.split(":", 1)[1].strip())
+                                break
+                    except:
+                        pass
+                if "transfer-encoding: chunked" in header_text:
+                    chunked = True
+
+            # Эвристика: если получили много данных — хватит
+            if len(response_data) > 50000:
+                break
+
+            # Если знаем длину — ждём полных данных
+            if content_length and len(response_data) >= content_length + len(header_bytes) + 4:
+                break
+
         return response_data.decode('utf-8', errors='ignore')
 
     def get_statistics(self) -> Dict[str, Any]:
@@ -292,20 +341,20 @@ class RedditDPIBypasser:
         return {
             "total_sessions": self.session_count,
             "successful_sessions": self.successful_sessions,
-            "success_rate": success_rate,
+            "success_rate": round(success_rate, 3),
             "current_profile": {
                 "modes": [m.value for m in self.current_profile.obfuscation_modes],
-                "jitter": self.current_profile.delay_jitter_ms,
-                "burst": self.current_profile.packet_burst_size,
-                "fake_sni": self.current_profile.fake_sni
+                "jitter_ms": self.current_profile.delay_jitter_ms,
+                "burst_size": self.current_profile.packet_burst_size,
+                "fronting_host": self.current_profile.fronting_host
             }
         }
 
 async def main():
-    parser = argparse.ArgumentParser(description="Fixed Reddit DPI Circumvention Tool")
-    parser.add_argument("--host", default="www.reddit.com", help="Target host")
-    parser.add_argument("--port", type=int, default=443, help="Target port")
-    parser.add_argument("--path", default="/", help="Request path")
+    parser = argparse.ArgumentParser(description="Reddit DPI Bypasser v3 — Domain Fronting Edition")
+    parser.add_argument("--host", default="www.reddit.com", help="Target host (default: www.reddit.com)")
+    parser.add_argument("--port", type=int, default=443, help="Target port (default: 443)")
+    parser.add_argument("--path", default="/", help="Request path (default: /)")
     parser.add_argument("--test", action="store_true", help="Run connectivity test")
     parser.add_argument("--stats", action="store_true", help="Show statistics")
 
@@ -314,33 +363,33 @@ async def main():
     bypasser = RedditDPIBypasser(args.host, args.port)
 
     if args.test:
-        logger.info("Testing connection to Reddit...")
+        logger.info(f"🧪 Testing connection to {args.host}...")
         response = await bypasser.make_request(args.path)
         if response:
-            logger.info("✅ Connection successful!")
-            # Try to find title or status
+            logger.info("✅ Success! Received response from Reddit.")
+            # Показываем статус и заголовок
             lines = response.split("\n")
-            for line in lines[:20]:
-                if "<title>" in line or "HTTP/" in line:
-                    print(line.strip())
-                    break
-            print(f"\n📡 Response length: {len(response)} bytes")
+            for line in lines[:10]:
+                if line.startswith("HTTP/") or "<title>" in line:
+                    print(f"  {line.strip()}")
+            print(f"\n📦 Response size: {len(response)} bytes")
         else:
-            logger.error("❌ Connection failed")
+            logger.error("❌ Failed to connect. Try again — optimizer will adjust parameters.")
             sys.exit(1)
     elif args.stats:
-        logger.info("Running 3 test requests...")
+        logger.info("📈 Running 3 test requests for statistics...")
         for i in range(3):
+            logger.info(f"  Request {i+1}/3...")
             await bypasser.make_request("/")
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(1)
         stats = bypasser.get_statistics()
-        print("\n📊 Statistics:")
+        print("\n📊 Final Statistics:")
         print(json.dumps(stats, indent=2, ensure_ascii=False))
     else:
-        print("Reddit DPI Bypasser — Type 'quit' to exit")
+        print("🚀 Reddit DPI Bypasser — Type 'quit' to exit")
         while True:
             try:
-                path = input("\nEnter path (e.g. /r/Python): ").strip()
+                path = input("\nEnter Reddit path (e.g. /r/Python): ").strip()
                 if path.lower() in ('quit', 'exit', 'q'):
                     break
                 if not path:
@@ -348,14 +397,19 @@ async def main():
                 print(f"➡️  Requesting: {path}")
                 response = await bypasser.make_request(path)
                 if response:
-                    print(f"✅ Received {len(response)} bytes")
-                    # Show HTTP status line
+                    print(f"✅ Success! Received {len(response)} bytes")
                     first_line = response.split("\n")[0] if "\n" in response else response[:100]
                     print(f"HeaderCode: {first_line}")
+                    if "<title>" in response:
+                        title_start = response.find("<title>") + 7
+                        title_end = response.find("</title>", title_start)
+                        if title_start > 7 and title_end > title_start:
+                            title = response[title_start:title_end].strip()
+                            print(f"📄 Title: {title}")
                 else:
-                    print("❌ Request failed")
+                    print("❌ Request failed — optimizer will try new parameters next time")
             except KeyboardInterrupt:
-                print("\n🛑 Interrupted by user")
+                print("\n🛑 Exiting...")
                 break
             except Exception as e:
                 logger.error(f"Unexpected error: {e}")
@@ -364,7 +418,7 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("Shutting down gracefully...")
+        logger.info("👋 Goodbye!")
     except Exception as e:
-        logger.error(f"Fatal error: {e}")
+        logger.error(f"💥 Fatal error: {e}")
         sys.exit(1)
