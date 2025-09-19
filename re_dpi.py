@@ -304,7 +304,7 @@ class RedditDPIBypasser:
                 break
             response_data += chunk
 
-            if not headers_done and b"\r\n\r\n" in response_
+            if not headers_done and b"\r\n\r\n" in response_data:
                 headers_done = True
                 header_bytes = response_data.split(b"\r\n\r\n", 1)[0]
                 header_text = header_bytes.decode('utf-8', errors='ignore').lower()
